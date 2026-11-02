@@ -54,16 +54,29 @@ Platform-specific notes (WSL2 setup, native-Windows scheduled-task service, desk
 
 ## Quick Start
 
+### Windows Desktop
+
+Install SONIC from the [latest desktop release](https://github.com/open-jarvis/OpenJarvis/releases)
+and launch it from the Start menu. The desktop app starts and manages its API backend on port
+8000; no browser or separate backend command is needed.
+
+To run the desktop app from a source checkout:
+
 ```bash
-jarvis                          # start chatting (default: chat-simple)
-jarvis gui                      # start the graphical browser interface
-jarvis init --preset <name> --force  # replace config with a starter preset
+cd frontend
+npm install
+npm run tauri dev
 ```
 
-`jarvis gui` starts the local API server and frontend, then opens the graphical
-chat interface in your default browser. It requires Node.js 22+ and is
-available from a source checkout; packaged desktop installers are available
-from the [latest release](https://github.com/open-jarvis/OpenJarvis/releases).
+In development, Vite serves the frontend inside Tauri's native window. It does not open an
+external browser.
+
+### CLI
+
+```bash
+jarvis                          # start chatting (default: chat-simple)
+jarvis init --preset <name> --force  # replace config with a starter preset
+```
 
 > Prefix `jarvis ...` with `uv run`, or `source .venv/bin/activate` first.
 
@@ -182,3 +195,4 @@ OpenJarvis is part of [Intelligence Per Watt](https://www.intelligence-per-watt.
 ## License
 
 [Apache 2.0](LICENSE)
+"# SONIC_2.0" 
