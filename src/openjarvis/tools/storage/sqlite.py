@@ -101,6 +101,47 @@ class SQLiteMemory(MemoryBackend):
         documents: List[tuple[str, Optional[Dict[str, Any]]]],
     ) -> List[str]:
         """Atomically replace all documents associated with *source*."""
+        self._delete_legacy_source_rows({source})
+        return self._replace_source(source, documents)
+
+    def replace_sources(
+        self,
+        sources: Dict[str, List[tuple[str, Optional[Dict[str, Any]]]]],
+    ) -> Dict[str, List[str]]:
+        """Replace multiple sources while cleaning legacy rows in one scan."""
+        self._delete_legacy_source_rows(set(sources))
+        return {
+            source: self._replace_source(source, documents)
+            for source, documents in sources.items()
+        }
+
+    def _delete_legacy_source_rows(self, sources: set[str]) -> None:
+        """Remove older API-indexed rows whose source was stored in metadata."""
+        if not sources or self._db_path == ":memory:":
+            return
+
+        conn = sqlite3.connect(Path(self._db_path).expanduser())
+        try:
+            legacy_rows = conn.execute(
+                "SELECT id, metadata FROM documents WHERE source = ''"
+            ).fetchall()
+        finally:
+            conn.close()
+
+        for doc_id, metadata_json in legacy_rows:
+            try:
+                metadata = json.loads(metadata_json)
+            except (TypeError, json.JSONDecodeError):
+                continue
+            legacy_source = metadata.get("source") if isinstance(metadata, dict) else None
+            if isinstance(legacy_source, str) and legacy_source in sources:
+                self._rust_impl.delete(doc_id)
+
+    def _replace_source(
+        self,
+        source: str,
+        documents: List[tuple[str, Optional[Dict[str, Any]]]],
+    ) -> List[str]:
         payload = [
             (content, json.dumps(metadata) if metadata else None)
             for content, metadata in documents

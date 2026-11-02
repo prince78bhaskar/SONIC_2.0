@@ -12,6 +12,7 @@ from pydantic import BaseModel
 
 from openjarvis.connectors.store import KnowledgeStore
 from openjarvis.core.config import DEFAULT_CONFIG_DIR
+from openjarvis.tools.storage.ingest import extract_docx_text
 
 logger = logging.getLogger(__name__)
 
@@ -85,20 +86,11 @@ def _extract_text_from_pdf(data: bytes) -> str:
 
 
 def _extract_text_from_docx(data: bytes) -> str:
-    """Extract text from a .docx file using python-docx."""
+    """Extract text from a .docx file using the shared document parser."""
     try:
-        from docx import Document  # type: ignore[import-untyped]
-
-        doc = Document(io.BytesIO(data))
-        return "\n\n".join(p.text for p in doc.paragraphs if p.text.strip())
-    except ImportError:
-        raise HTTPException(
-            status_code=500,
-            detail=(
-                "DOCX parsing requires python-docx. "
-                "Install with: pip install python-docx"
-            ),
-        )
+        return extract_docx_text(data)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def _get_store() -> KnowledgeStore:

@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import io
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Tuple
+from zipfile import BadZipFile, ZipFile
 
 from openjarvis.tools.storage.chunking import Chunk, ChunkConfig, chunk_text
 
@@ -64,6 +67,12 @@ _CODE_EXTS = frozenset(
     }
 )
 
+_DOCX_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+
+
+def _docx_tag(name: str) -> str:
+    return f"{{{_DOCX_NS}}}{name}"
+
 
 @dataclass(slots=True)
 class DocumentMeta:
@@ -76,12 +85,14 @@ class DocumentMeta:
 
 
 def detect_file_type(path: Path) -> str:
-    """Map a file extension to one of: text, markdown, pdf, code."""
+    """Map a file extension to one of: text, markdown, pdf, docx, code."""
     suffix = path.suffix.lower()
     if suffix in {".md", ".markdown", ".mdx"}:
         return "markdown"
     if suffix == ".pdf":
         return "pdf"
+    if suffix == ".docx":
+        return "docx"
     if suffix in _CODE_EXTS:
         return "code"
     return "text"
@@ -112,6 +123,8 @@ def read_document(path: Path) -> Tuple[str, DocumentMeta]:
             ) from None
 
         text = _read_pdf(path)
+    elif ftype == "docx":
+        text = extract_docx_text(path.read_bytes())
     else:
         text = _read_text(path)
 
@@ -144,6 +157,62 @@ def _read_pdf(path: Path) -> str:
             if text:
                 pages.append(text)
     return "\n\n".join(pages)
+
+
+def extract_docx_text(data: bytes) -> str:
+    """Extract paragraphs and table rows from a DOCX document.
+
+    DOCX files are ZIP packages, so decoding their bytes as text indexes
+    container/XML data instead of the document's contents. Parse the main
+    WordprocessingML document with the standard library to avoid an optional
+    parser dependency.
+    """
+    try:
+        with ZipFile(io.BytesIO(data)) as archive:
+            document_xml = archive.read("word/document.xml")
+    except (BadZipFile, KeyError, OSError, RuntimeError) as exc:
+        raise ValueError("Invalid or unreadable DOCX document") from exc
+
+    try:
+        document = ET.fromstring(document_xml)
+    except ET.ParseError as exc:
+        raise ValueError("Invalid DOCX document XML") from exc
+
+    body = document.find(_docx_tag("body"))
+    if body is None:
+        return ""
+
+    def paragraph_text(paragraph: ET.Element) -> str:
+        parts: List[str] = []
+        for node in paragraph.iter():
+            if node.tag == _docx_tag("t") and node.text:
+                parts.append(node.text)
+            elif node.tag == _docx_tag("tab"):
+                parts.append("\t")
+            elif node.tag in {_docx_tag("br"), _docx_tag("cr")}:
+                parts.append("\n")
+        return "".join(parts).strip()
+
+    blocks: List[str] = []
+    for block in body:
+        if block.tag == _docx_tag("p"):
+            text = paragraph_text(block)
+            if text:
+                blocks.append(text)
+        elif block.tag == _docx_tag("tbl"):
+            for row in block.findall(_docx_tag("tr")):
+                cells: List[str] = []
+                for cell in row.findall(_docx_tag("tc")):
+                    cell_paragraphs = [
+                        text
+                        for paragraph in cell.iter(_docx_tag("p"))
+                        if (text := paragraph_text(paragraph))
+                    ]
+                    cells.append(" ".join(cell_paragraphs))
+                if any(cells):
+                    blocks.append("\t".join(cells).rstrip())
+
+    return "\n".join(blocks)
 
 
 def _should_skip_dir(name: str) -> bool:
@@ -236,7 +305,7 @@ def ingest_path(
             text, _meta = read_document(child)
             chunks = chunk_text(text, source=str(child), config=config)
             all_chunks.extend(chunks)
-        except (ImportError, OSError):
+        except (ImportError, OSError, ValueError):
             # Skip files we can't read (e.g. PDF without pdfplumber)
             continue
 

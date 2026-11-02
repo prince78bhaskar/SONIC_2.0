@@ -25,8 +25,8 @@ export default defineConfig({
     VitePWA({
       registerType: 'autoUpdate',
       manifest: {
-        name: 'OpenJarvis',
-        short_name: 'Jarvis',
+        name: 'SONIC',
+        short_name: 'SONIC',
         description: 'On-device AI assistant',
         theme_color: '#161618',
         background_color: '#161618',
@@ -65,6 +65,7 @@ export default defineConfig({
   },
   server: {
     port: 5173,
+    open: false,
     proxy: {
       // ws: true is required for the /v1/agents/events WebSocket. Without it
       // Vite proxies the HTTP request but not the upgrade, so the socket never

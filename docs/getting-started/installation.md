@@ -77,37 +77,23 @@ Then open [http://localhost:5173](http://localhost:5173).
 
 ## Desktop App
 
-The desktop app is a native window for the OpenJarvis chat UI. All inference and backend
-processing happens on your local machine — the app connects to the backend you start locally.
+SONIC runs in a native Tauri window. The desktop app starts and manages its local API backend
+on port 8000, and stops its owned backend when the app closes. You do not need to start a
+separate backend or open a browser.
 
-### Setup
+### Windows
 
-**Step 1.** Start the backend (same as Browser App):
-
-```bash
-git clone https://github.com/open-jarvis/OpenJarvis.git
-cd OpenJarvis
-./scripts/quickstart.sh
-```
-
-**Step 2.** Download and open the desktop app:
+Download and launch SONIC from the Windows installer:
 
 | Platform | Download |
 |----------|----------|
 | macOS (Universal) | [:material-download: **OpenJarvis.dmg**](https://github.com/open-jarvis/OpenJarvis/releases/download/desktop-v1.0.2/OpenJarvis_1.0.1_universal.dmg) |
-| Windows (64-bit) | [:material-download: **OpenJarvis-setup.exe**](https://github.com/open-jarvis/OpenJarvis/releases/download/desktop-v1.0.2/OpenJarvis_1.0.1_x64-setup.exe) |
+| Windows (64-bit) | [:material-download: **SONIC Windows installer**](https://github.com/open-jarvis/OpenJarvis/releases) |
 | Linux (DEB) | [:material-download: **OpenJarvis.deb**](https://github.com/open-jarvis/OpenJarvis/releases/download/desktop-v1.0.2/OpenJarvis_1.0.1_amd64.deb) |
 | Linux (RPM) | [:material-download: **OpenJarvis.rpm**](https://github.com/open-jarvis/OpenJarvis/releases/download/desktop-v1.0.2/OpenJarvis-1.0.1-1.x86_64.rpm) |
 | Linux (AppImage) | [:material-download: **OpenJarvis.AppImage**](https://github.com/open-jarvis/OpenJarvis/releases/download/desktop-v1.0.2/OpenJarvis_1.0.1_amd64.AppImage) |
 
-The app connects to `http://localhost:8000` automatically.
-
-!!! warning "macOS: \"app is damaged\""
-    If macOS says the app is damaged, clear the Gatekeeper quarantine flag:
-    ```bash
-    xattr -cr /Applications/OpenJarvis.app
-    ```
-    This is normal for open-source apps distributed outside the App Store.
+Launch SONIC from the Start menu. It waits for the backend health check before using the API.
 
 !!! tip "All releases"
     Browse all versions on the [GitHub Releases](https://github.com/open-jarvis/OpenJarvis/releases) page.
@@ -116,12 +102,14 @@ The app connects to `http://localhost:8000` automatically.
 
 ```bash
 git clone https://github.com/open-jarvis/OpenJarvis.git
-cd OpenJarvis/desktop
+cd OpenJarvis/frontend
 npm install
-npm run tauri build
+npm run tauri dev
 ```
 
-The built installer will be in `frontend/src-tauri/target/release/bundle/`.
+This launches the native Tauri window. Vite serves the development frontend inside that window
+and does not open an external browser. To build a Windows installer, run `npm run tauri build`;
+the installer is written under `src-tauri/target/release/bundle/`.
 
 ---
 

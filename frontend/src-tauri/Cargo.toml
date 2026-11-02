@@ -23,6 +23,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.13", features = ["json", "multipart"] }
 tokio = { version = "1", features = ["full"] }
+fs2 = "0.4"
 
 # Cloud API keys are stored in the OS credential store via `keyring`. keyring v3
 # enables NO backend by default — without an explicit per-platform feature it
@@ -40,6 +41,9 @@ keyring = { version = "3", features = ["windows-native"] }
 # Blocking Secret Service backend (no internal async runtime, so it is safe to
 # call from the tokio-driven Tauri commands). Needs libdbus-1-dev at build time.
 keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [features]
 default = ["custom-protocol"]

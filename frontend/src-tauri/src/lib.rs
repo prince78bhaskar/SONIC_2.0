@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::menu::{MenuBuilder, MenuItemBuilder};
@@ -8,6 +9,7 @@ use tokio::sync::Mutex;
 
 const OLLAMA_PORT: u16 = 11434;
 const JARVIS_PORT: u16 = 8000;
+static NEXT_BACKEND_LAUNCH_TOKEN: AtomicU64 = AtomicU64::new(1);
 #[cfg(not(all(target_os = "windows", target_arch = "aarch64")))]
 const DESKTOP_UV_SYNC_COMMAND: &str =
     "uv sync --extra desktop --extra inference-cloud --extra inference-google --group desktop-native";
@@ -398,12 +400,418 @@ fn project_root_near_executable(exe: &std::path::Path) -> Option<std::path::Path
 
 struct ChildHandle {
     child: tokio::process::Child,
+    pid: u32,
+    launch_token: Option<String>,
 }
 
 impl ChildHandle {
-    async fn kill(&mut self) {
-        let _ = self.child.kill().await;
+    async fn stop(&mut self) -> Result<(), String> {
+        self.stop_process_tree().await?;
+        if let Some(token) = &self.launch_token {
+            clear_owned_server_state(token)?;
+        }
+        Ok(())
     }
+
+    async fn stop_process_tree(&mut self) -> Result<(), String> {
+        #[cfg(unix)]
+        {
+            let pgid = i32::try_from(self.pid)
+                .map_err(|_| format!("Invalid backend process ID {}", self.pid))?;
+            let graceful_error = if unsafe { libc::kill(-pgid, libc::SIGTERM) } != 0 {
+                let error = std::io::Error::last_os_error();
+                (error.kind() != std::io::ErrorKind::NotFound).then(|| {
+                    format!(
+                        "Could not gracefully stop backend process group {}: {}",
+                        self.pid, error
+                    )
+                })
+            } else {
+                None
+            };
+
+            if wait_for_process_group_exit(self.pid, Duration::from_secs(8), &mut self.child)
+                .await?
+            {
+                return self.wait_for_exit().await;
+            }
+
+            if unsafe { libc::kill(-pgid, libc::SIGKILL) } != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    return Err(format!(
+                        "{}; could not force-stop backend process group {}: {}",
+                        graceful_error.unwrap_or_else(|| {
+                            format!("Backend process group {} did not stop gracefully", self.pid)
+                        }),
+                        self.pid,
+                        error,
+                    ));
+                }
+            }
+
+            if wait_for_process_group_exit(self.pid, Duration::from_secs(3), &mut self.child)
+                .await?
+            {
+                return self.wait_for_exit().await;
+            }
+
+            return Err(graceful_error.unwrap_or_else(|| {
+                format!(
+                    "Backend process group {} is still running after forced shutdown",
+                    self.pid
+                )
+            }));
+        }
+
+        #[cfg(windows)]
+        {
+            let pid = self.pid.to_string();
+            let graceful_error = stop_windows_process_tree(&pid, false).await.err();
+            if self
+                .wait_for_exit_with_timeout(Duration::from_secs(8))
+                .await?
+            {
+                return Ok(());
+            }
+
+            if let Err(force_error) = stop_windows_process_tree(&pid, true).await {
+                let _ = self.child.start_kill();
+                let root_stopped = self
+                    .wait_for_exit_with_timeout(Duration::from_secs(3))
+                    .await?;
+                return Err(format!(
+                    "{}; forced tree shutdown failed: {} (owned root stopped: {})",
+                    graceful_error.unwrap_or_else(|| {
+                        format!("Graceful shutdown timed out for PID {}", self.pid)
+                    }),
+                    force_error,
+                    root_stopped
+                ));
+            }
+            if self
+                .wait_for_exit_with_timeout(Duration::from_secs(3))
+                .await?
+            {
+                return Ok(());
+            }
+
+            Err(graceful_error.unwrap_or_else(|| {
+                format!(
+                    "Backend process tree rooted at PID {} is still running after forced shutdown",
+                    self.pid
+                )
+            }))
+        }
+
+        #[cfg(not(any(unix, windows)))]
+        {
+            self.child
+                .kill()
+                .await
+                .map_err(|e| format!("Could not stop backend process {}: {}", self.pid, e))?;
+            self.child
+                .wait()
+                .await
+                .map_err(|e| format!("Could not wait for backend process {}: {}", self.pid, e))?;
+            Ok(())
+        }
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_exit(&mut self) -> Result<(), String> {
+        self.child
+            .wait()
+            .await
+            .map_err(|e| format!("Could not reap backend process {}: {}", self.pid, e))?;
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    async fn wait_for_exit_with_timeout(&mut self, timeout: Duration) -> Result<bool, String> {
+        match tokio::time::timeout(timeout, self.child.wait()).await {
+            Ok(Ok(_)) => Ok(true),
+            Ok(Err(error)) => Err(format!(
+                "Could not wait for backend process {}: {}",
+                self.pid, error
+            )),
+            Err(_) => Ok(false),
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn wait_for_process_group_exit(
+    pgid: u32,
+    timeout: Duration,
+    child: &mut tokio::process::Child,
+) -> Result<bool, String> {
+    let Ok(pgid) = i32::try_from(pgid) else {
+        return Err(format!("Invalid backend process group ID {}", pgid));
+    };
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        child.try_wait().map_err(|error| {
+            format!("Could not check owned backend process {}: {}", pgid, error)
+        })?;
+        let result = unsafe { libc::kill(-pgid, 0) };
+        if result != 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound {
+            return Ok(true);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(false);
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[cfg(windows)]
+async fn stop_windows_process_tree(pid: &str, force: bool) -> Result<(), String> {
+    let mut command = tokio::process::Command::new("taskkill");
+    command.args(["/PID", pid, "/T"]);
+    if force {
+        command.arg("/F");
+    }
+    let output = tokio::time::timeout(Duration::from_secs(5), command.output())
+        .await
+        .map_err(|_| {
+            format!(
+                "Timed out stopping backend process tree rooted at PID {}",
+                pid
+            )
+        })?
+        .map_err(|e| {
+            format!(
+                "Could not run taskkill for owned backend PID {}: {}",
+                pid, e
+            )
+        })?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(format!(
+            "Could not stop owned backend process tree rooted at PID {}: {}",
+            pid,
+            if detail.is_empty() {
+                format!("taskkill exited with {}", output.status)
+            } else {
+                detail
+            }
+        ))
+    }
+}
+
+fn backend_launch_token() -> String {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let sequence = NEXT_BACKEND_LAUNCH_TOKEN.fetch_add(1, Ordering::Relaxed);
+    format!("sonic-{}-{}-{}", std::process::id(), timestamp, sequence)
+}
+
+fn backend_config_dir() -> Result<std::path::PathBuf, String> {
+    let working_dir = find_project_root()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let home = std::path::PathBuf::from(home_dir());
+    if home.as_os_str().is_empty() {
+        return Err("Could not resolve the backend home directory".into());
+    }
+
+    let resolve = |value: &str| {
+        let value = if value == "~" {
+            home.clone()
+        } else {
+            value
+                .strip_prefix("~/")
+                .or_else(|| value.strip_prefix("~\\"))
+                .map(|rest| home.join(rest))
+                .unwrap_or_else(|| std::path::PathBuf::from(value))
+        };
+        if value.is_absolute() {
+            value
+        } else {
+            working_dir.join(value)
+        }
+    };
+
+    if let Some(path) = std::env::var_os("OPENJARVIS_HOME").filter(|path| !path.is_empty()) {
+        return Ok(resolve(&path.to_string_lossy()));
+    }
+    if let Some(path) = std::env::var_os("XDG_DATA_HOME").filter(|path| !path.is_empty()) {
+        return Ok(resolve(&path.to_string_lossy()).join("openjarvis"));
+    }
+    Ok(home.join(".openjarvis"))
+}
+
+fn clear_owned_server_state(launch_token: &str) -> Result<(), String> {
+    let config_dir = backend_config_dir()?;
+    clear_owned_server_state_at(&config_dir, launch_token)
+}
+
+fn clear_owned_server_state_at(
+    config_dir: &std::path::Path,
+    launch_token: &str,
+) -> Result<(), String> {
+    use fs2::FileExt;
+    use std::fs::OpenOptions;
+
+    let state_path = config_dir.join("server.json");
+    if !state_path.exists() {
+        return Ok(());
+    }
+
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(config_dir.join("server.lock"))
+        .map_err(|error| format!("Could not open backend state lock: {}", error))?;
+    FileExt::lock_exclusive(&lock)
+        .map_err(|error| format!("Could not lock backend state: {}", error))?;
+
+    let cleanup = (|| {
+        let state: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&state_path)
+                .map_err(|error| format!("Could not read backend state: {}", error))?,
+        )
+        .map_err(|error| format!("Could not parse backend state: {}", error))?;
+        if state.get("launch_token").and_then(|value| value.as_str()) != Some(launch_token) {
+            return Ok(());
+        }
+        let Some(pid) = state.get("pid").and_then(|value| value.as_u64()) else {
+            return Err("Owned backend state has no valid PID".into());
+        };
+
+        let pid_path = config_dir.join("server.pid");
+        let has_pid_file = match std::fs::read_to_string(&pid_path) {
+            Ok(contents) if contents.trim().parse::<u64>().ok() == Some(pid) => true,
+            Ok(_) => return Err("Backend PID file does not match owned server state".into()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(format!("Could not read backend PID file: {}", error));
+            }
+        };
+
+        let identity_path = config_dir.join("server.identity.json");
+        let has_identity_file = match std::fs::read(&identity_path) {
+            Ok(contents)
+                if serde_json::from_slice::<serde_json::Value>(&contents)
+                    .ok()
+                    .and_then(|identity| identity.get("pid").and_then(|value| value.as_u64()))
+                    == Some(pid) =>
+            {
+                true
+            }
+            Ok(_) => {
+                return Err("Backend identity file does not match owned server state".into());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => {
+                return Err(format!("Could not read backend identity file: {}", error));
+            }
+        };
+
+        let current: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&state_path)
+                .map_err(|error| format!("Could not re-read backend state: {}", error))?,
+        )
+        .map_err(|error| format!("Could not re-parse backend state: {}", error))?;
+        if current.get("launch_token").and_then(|value| value.as_str()) == Some(launch_token)
+            && current.get("pid").and_then(|value| value.as_u64()) == Some(pid)
+        {
+            if has_pid_file {
+                std::fs::remove_file(&pid_path).map_err(|error| {
+                    format!("Could not remove owned backend PID file: {}", error)
+                })?;
+            }
+            if has_identity_file {
+                std::fs::remove_file(&identity_path).map_err(|error| {
+                    format!("Could not remove owned backend identity file: {}", error)
+                })?;
+            }
+            std::fs::remove_file(&state_path)
+                .map_err(|error| format!("Could not remove owned backend state: {}", error))?;
+        } else {
+            return Err("Backend state ownership changed during cleanup".into());
+        }
+        Ok(())
+    })();
+
+    let unlock = FileExt::unlock(&lock)
+        .map_err(|error| format!("Could not unlock backend state: {}", error));
+    cleanup?;
+    unlock
+}
+
+fn spawn_backend_child(
+    cmd: &mut tokio::process::Command,
+    launch_token: Option<String>,
+) -> std::io::Result<ChildHandle> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.as_std_mut().process_group(0);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.as_std_mut().creation_flags(CREATE_NEW_PROCESS_GROUP);
+    }
+
+    let child = spawn_owned_child(cmd)?;
+    let Some(pid) = child.id() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Spawned backend process did not expose a process ID",
+        ));
+    };
+    Ok(ChildHandle {
+        child,
+        pid,
+        launch_token,
+    })
+}
+
+async fn start_managed_jarvis(
+    backend: &SharedBackend,
+    cmd: &mut tokio::process::Command,
+    allow_boot_task: bool,
+) -> Result<(), String> {
+    let mut manager = backend.lock().await;
+    if let Some(existing) = manager.jarvis.as_mut() {
+        match existing.child.try_wait() {
+            Ok(None) => return Ok(()),
+            Ok(Some(_)) => manager.jarvis = None,
+            Err(error) => {
+                return Err(format!(
+                    "Could not check owned jarvis process {}: {}",
+                    existing.pid, error
+                ));
+            }
+        }
+    }
+    if !allow_boot_task && manager.boot_task.is_some() {
+        return Err("The managed API server is already starting.".into());
+    }
+    check_jarvis_port_available()?;
+
+    let launch_token = backend_launch_token();
+    cmd.env("OPENJARVIS_DAEMON_LAUNCH_TOKEN", &launch_token);
+    let mut child = spawn_backend_child(cmd, Some(launch_token))
+        .map_err(|error| format!("Failed to launch jarvis serve: {}", error))?;
+    let stderr = child.child.stderr.take();
+    let tail = manager.jarvis_stderr_tail.clone();
+    manager.jarvis = Some(child);
+    drop(manager);
+    if let Some(stderr) = stderr {
+        spawn_jarvis_stderr_drainer(stderr, tail);
+    }
+    Ok(())
 }
 
 /// Spawn a subprocess whose lifetime cannot escape the async operation that
@@ -432,6 +840,7 @@ struct BackendManager {
     jarvis: Option<ChildHandle>,
     jarvis_stderr_tail: StderrTail,
     boot_task: Option<tauri::async_runtime::JoinHandle<()>>,
+    boot_task_active: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Default for BackendManager {
@@ -441,43 +850,86 @@ impl Default for BackendManager {
             jarvis: None,
             jarvis_stderr_tail: Arc::new(Mutex::new(Vec::new())),
             boot_task: None,
+            boot_task_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 }
 
+struct BootTaskActiveGuard(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for BootTaskActiveGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 impl BackendManager {
-    async fn stop_all(&mut self) {
+    async fn stop_jarvis(&mut self) -> Result<bool, String> {
+        let mut stopped = false;
         if let Some(task) = self.boot_task.take() {
             task.abort();
             // `abort()` only requests cancellation.  Await it before touching
             // children or returning so the boot future has dropped any local,
             // not-yet-registered child and cannot write config after reset.
             let _ = task.await;
+            stopped = true;
         }
-        if let Some(ref mut h) = self.jarvis {
-            h.kill().await;
+        self.boot_task_active.store(false, Ordering::Release);
+        if let Some(mut child) = self.jarvis.take() {
+            child.stop().await?;
+            stopped = true;
         }
-        self.jarvis = None;
-        if let Some(ref mut h) = self.ollama {
-            h.kill().await;
+        Ok(stopped)
+    }
+
+    async fn stop_all(&mut self) -> Result<(), String> {
+        let mut errors = Vec::new();
+        if let Err(error) = self.stop_jarvis().await {
+            errors.push(error);
         }
-        self.ollama = None;
+        if let Some(mut child) = self.ollama.take() {
+            if let Err(error) = child.stop().await {
+                errors.push(error);
+            }
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
     }
 }
 
 type SharedBackend = Arc<Mutex<BackendManager>>;
 
-/// Spawn exactly one tracked boot task. Keeping its handle lets recovery
-/// abort an in-flight endpoint check/model download before killing children.
-async fn start_managed_boot(backend: SharedBackend, status: SharedStatus) {
+/// Start one tracked boot task, reusing an existing server or in-flight boot.
+async fn start_managed_boot(backend: SharedBackend, status: SharedStatus) -> Result<(), String> {
     let mut manager = backend.lock().await;
-    if let Some(task) = manager.boot_task.take() {
-        task.abort();
-        let _ = task.await;
+    if let Some(existing) = manager.jarvis.as_mut() {
+        match existing.child.try_wait() {
+            Ok(None) => return Ok(()),
+            Ok(Some(_)) => manager.jarvis = None,
+            Err(error) => {
+                return Err(format!(
+                    "Could not check owned API server process {}: {}",
+                    existing.pid, error
+                ));
+            }
+        }
     }
+    if manager.boot_task_active.load(Ordering::Acquire) {
+        return Ok(());
+    }
+    manager.boot_task.take();
+    manager.boot_task_active.store(true, Ordering::Release);
     let task_backend = backend.clone();
-    let task = tauri::async_runtime::spawn(boot_backend(task_backend, status));
+    let active = manager.boot_task_active.clone();
+    let task = tauri::async_runtime::spawn(async move {
+        let _active_guard = BootTaskActiveGuard(active);
+        boot_backend(task_backend, status).await;
+    });
     manager.boot_task = Some(task);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -645,6 +1097,7 @@ async fn wait_for_jarvis_health(
     url: &str,
     timeout: Duration,
     backend: &SharedBackend,
+    fail_on_service_unavailable: bool,
 ) -> JarvisStartResult {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
@@ -681,7 +1134,8 @@ async fn wait_for_jarvis_health(
                 if status.is_success() {
                     return JarvisStartResult::Ready;
                 }
-                if status == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                if fail_on_service_unavailable && status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+                {
                     // Server is up but the inference engine is not. This
                     // is a terminal-for-us state — polling won't change
                     // anything; the user has to fix their engine config.
@@ -1084,7 +1538,7 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
         }
 
         // Try the bundled sidecar first, fall back to system ollama
-        let ollama_child = {
+        {
             let ollama_bin = resolve_bin("ollama");
             let mut sidecar_cmd = tokio::process::Command::new(&ollama_bin);
             sidecar_cmd
@@ -1094,14 +1548,11 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
                 .stderr(std::process::Stdio::null());
             // Avoid LD_LIBRARY_PATH leak when running inside an AppImage (#455).
             prepare_subprocess_for_appimage(&mut sidecar_cmd);
-            match spawn_owned_child(&mut sidecar_cmd) {
-                Ok(child) => Some(child),
-                Err(_) => None,
+            let mut manager = backend.lock().await;
+            match spawn_backend_child(&mut sidecar_cmd, None) {
+                Ok(child) => manager.ollama = Some(child),
+                Err(_) => {}
             }
-        };
-
-        if let Some(child) = ollama_child {
-            backend.lock().await.ollama = Some(ChildHandle { child });
         }
 
         let ollama_url = format!("http://127.0.0.1:{}/api/tags", OLLAMA_PORT);
@@ -1615,37 +2066,19 @@ async fn boot_backend(backend: SharedBackend, status: SharedStatus) {
     for (key, value) in cloud_keys_for_inference(&cfg) {
         cmd.env(&key, &value);
     }
-    let jarvis_child = spawn_owned_child(&mut cmd);
-
-    match jarvis_child {
-        Ok(mut child) => {
-            // Start draining stderr immediately. If we wait until the
-            // health check returns we risk filling the 4 KB Windows pipe
-            // buffer during startup logging and hanging the child before
-            // it can bind its HTTP port — exactly the symptom in #309.
-            let stderr_handle = child.stderr.take();
-            let mut mgr = backend.lock().await;
-            let tail = mgr.jarvis_stderr_tail.clone();
-            mgr.jarvis = Some(ChildHandle { child });
-            drop(mgr);
-            if let Some(stderr) = stderr_handle {
-                spawn_jarvis_stderr_drainer(stderr, tail);
-            }
-        }
-        Err(e) => {
-            let mut s = status.lock().await;
-            s.error = Some(format!(
-                "Could not start jarvis server: {}. \
-                 Make sure uv is installed (https://astral.sh/uv) and the OpenJarvis repo is cloned at {}",
-                e,
-                root.display(),
-            ));
-            return;
-        }
+    if let Err(error) = start_managed_jarvis(&backend, &mut cmd, true).await {
+        let mut s = status.lock().await;
+        s.error = Some(format!(
+            "Could not start jarvis server: {}. \
+             Make sure uv is installed (https://astral.sh/uv) and the OpenJarvis repo is cloned at {}",
+            error,
+            root.display(),
+        ));
+        return;
     }
 
     let server_url = format!("http://127.0.0.1:{}/health", JARVIS_PORT);
-    match wait_for_jarvis_health(&server_url, Duration::from_secs(600), &backend).await {
+    match wait_for_jarvis_health(&server_url, Duration::from_secs(600), &backend, true).await {
         JarvisStartResult::Ready => {}
         JarvisStartResult::ServiceUnavailable(body) => {
             let mut s = status.lock().await;
@@ -1769,14 +2202,13 @@ async fn start_backend(
     }
     let b = backend.inner().clone();
     let s = status.inner().clone();
-    start_managed_boot(b, s).await;
+    start_managed_boot(b, s).await?;
     Ok(())
 }
 
 #[tauri::command]
 async fn stop_backend(backend: tauri::State<'_, SharedBackend>) -> Result<(), String> {
-    backend.lock().await.stop_all().await;
-    Ok(())
+    backend.lock().await.stop_all().await
 }
 
 /// Abort startup, stop every child, discard an unworkable source, and return
@@ -1786,7 +2218,7 @@ async fn reset_inference_source(
     backend: tauri::State<'_, SharedBackend>,
     status: tauri::State<'_, SharedStatus>,
 ) -> Result<(), String> {
-    backend.lock().await.stop_all().await;
+    backend.lock().await.stop_all().await?;
     discard_pending_inference_setup()?;
     *status.lock().await = SetupStatus::default();
     Ok(())
@@ -1969,28 +2401,35 @@ async fn fetch_models(api_url: String) -> Result<serde_json::Value, String> {
 }
 
 #[tauri::command]
-async fn run_jarvis_command(args: Vec<String>) -> Result<String, String> {
-    let uv_bin = resolve_bin("uv");
-
-    let mut cmd_args = vec!["run".to_string(), "jarvis".to_string()];
-    cmd_args.extend(args.iter().cloned());
-
-    let mut cmd = tokio::process::Command::new(&uv_bin);
-    cmd.args(&cmd_args);
-    // Run from the project root so `uv run jarvis` resolves the OpenJarvis
-    // project regardless of the app's launch cwd. In a packaged install the
-    // cwd isn't the checkout, so without this `jarvis` isn't found and the
-    // backend never starts — the UI then shows "Failed to get response"
-    // (see #531).
-    if let Some(ref root) = find_project_root() {
-        cmd.current_dir(root);
+async fn run_jarvis_command(
+    args: Vec<String>,
+    backend: tauri::State<'_, SharedBackend>,
+    status: tauri::State<'_, SharedStatus>,
+) -> Result<String, String> {
+    if args.len() == 1 && args[0] == "stop" {
+        return match backend.lock().await.stop_jarvis().await? {
+            true => Ok("Managed API server stopped.".into()),
+            false => Ok(
+                "No app-owned API server was running; external servers were left untouched.".into(),
+            ),
+        };
     }
 
     let is_serve = args.first().map(|a| a.as_str() == "serve").unwrap_or(false);
 
     if !is_serve {
-        // Short-lived command (e.g. `stop`, `status`): wait for it and return
-        // its captured output.
+        // Short-lived informational commands (e.g. `status`) still use the
+        // CLI. Server start and stop are handled by the tracked manager.
+        let uv_bin = resolve_bin("uv");
+        let mut cmd_args = vec!["run".to_string(), "jarvis".to_string()];
+        cmd_args.extend(args.iter().cloned());
+        let mut cmd = tokio::process::Command::new(&uv_bin);
+        cmd.args(&cmd_args);
+        // Run from the project root so `uv run jarvis` resolves the project
+        // regardless of the app's launch cwd.
+        if let Some(ref root) = find_project_root() {
+            cmd.current_dir(root);
+        }
         let output = cmd
             .output()
             .await
@@ -2002,57 +2441,26 @@ async fn run_jarvis_command(args: Vec<String>) -> Result<String, String> {
         };
     }
 
-    // `jarvis serve` is a long-running server that never exits. The old code
-    // used `.output()`, which waits for the process to exit and so hung this
-    // command forever — the "Start" button never resolved (#531). Spawn it
-    // detached instead, drain stderr (a full 4 KB Windows pipe can otherwise
-    // stall the child mid-startup, #309), and poll /health for readiness.
-    cmd.stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped());
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("Failed to launch jarvis serve: {}", e))?;
-
-    let tail: StderrTail = Arc::new(Mutex::new(Vec::new()));
-    if let Some(stderr) = child.stderr.take() {
-        spawn_jarvis_stderr_drainer(stderr, tail.clone());
-    }
-
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .map_err(|e| format!("Failed to build HTTP client: {}", e))?;
+    let shared_backend = backend.inner().clone();
+    let shared_status = status.inner().clone();
+    start_managed_boot(shared_backend.clone(), shared_status).await?;
     let url = format!("http://127.0.0.1:{}/health", JARVIS_PORT);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-
-    loop {
-        // Surface an early crash (bad venv, missing Rust ext, etc.) right away
-        // instead of waiting out the full readiness timeout.
-        if let Ok(Some(status)) = child.try_wait() {
-            let stderr = String::from_utf8_lossy(tail.lock().await.as_slice()).into_owned();
-            return Err(format!(
-                "jarvis serve exited (code {:?}) before becoming healthy:\n{}",
-                status.code(),
-                stderr.trim()
-            ));
+    match wait_for_jarvis_health(&url, Duration::from_secs(120), &shared_backend, false).await {
+        JarvisStartResult::Ready => Ok(format!(
+            "jarvis serve is ready on http://127.0.0.1:{}",
+            JARVIS_PORT
+        )),
+        JarvisStartResult::ServiceUnavailable(body) => {
+            Err(format!("jarvis serve is not ready: {}", body))
         }
-        if let Ok(resp) = client.get(&url).send().await {
-            if resp.status().is_success() {
-                // Leave the server running (the Child is detached on drop —
-                // kill_on_drop defaults to false); `stop` tears it down.
-                return Ok(format!(
-                    "jarvis serve is ready on http://127.0.0.1:{}",
-                    JARVIS_PORT
-                ));
-            }
-        }
-        if tokio::time::Instant::now() >= deadline {
-            return Err(format!(
-                "jarvis serve did not become healthy on port {} within 120s.",
-                JARVIS_PORT
-            ));
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        JarvisStartResult::EarlyExit { code, stderr } => Err(format!(
+            "jarvis serve exited (code {:?}) before becoming healthy:\n{}",
+            code, stderr
+        )),
+        JarvisStartResult::Timeout => Err(format!(
+            "jarvis serve did not become healthy on port {} within 120s.",
+            JARVIS_PORT
+        )),
     }
 }
 
@@ -3354,6 +3762,8 @@ pub fn run() {
 
     let boot_backend_ref = backend.clone();
     let boot_status_ref = status.clone();
+    let shutdown_state = Arc::new(AtomicU8::new(0));
+    let exit_shutdown_state = shutdown_state.clone();
 
     tauri::Builder::default()
         .manage(backend.clone())
@@ -3439,7 +3849,12 @@ pub fn run() {
             // a source. Fresh installs stay inert until the setup UI records
             // explicit consent and invokes `start_backend`.
             if configured_at_launch.is_some() {
-                tauri::async_runtime::spawn(start_managed_boot(boot_backend_ref, boot_status_ref));
+                tauri::async_runtime::spawn(async move {
+                    if let Err(error) = start_managed_boot(boot_backend_ref, boot_status_ref).await
+                    {
+                        eprintln!("Could not start managed backend boot: {}", error);
+                    }
+                });
             }
 
             Ok(())
@@ -3478,12 +3893,26 @@ pub fn run() {
         ])
         .build(tauri::generate_context!())
         .expect("error while building OpenJarvis Desktop")
-        .run(move |_app, event| {
-            if let tauri::RunEvent::ExitRequested { .. } = event {
-                let b = backend.clone();
-                tauri::async_runtime::spawn(async move {
-                    b.lock().await.stop_all().await;
-                });
+        .run(move |app, event| {
+            if let tauri::RunEvent::ExitRequested { api, code, .. } = event {
+                match exit_shutdown_state.compare_exchange(0, 1, Ordering::SeqCst, Ordering::SeqCst)
+                {
+                    Ok(_) => {
+                        api.prevent_exit();
+                        let backend = backend.clone();
+                        let app = app.clone();
+                        let shutdown_state = exit_shutdown_state.clone();
+                        tauri::async_runtime::spawn(async move {
+                            if let Err(error) = backend.lock().await.stop_all().await {
+                                eprintln!("Backend shutdown failed: {}", error);
+                            }
+                            shutdown_state.store(2, Ordering::SeqCst);
+                            app.exit(code.unwrap_or(0));
+                        });
+                    }
+                    Err(1) => api.prevent_exit(),
+                    Err(_) => {}
+                }
             }
         });
 }
@@ -3495,21 +3924,23 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::{
-        boot_plan, default_local_model, discard_pending_inference_setup_at,
-        format_extension_import_failure, format_missing_rust_toolchain, format_port_unavailable,
-        format_uv_sync_failure, format_uv_sync_spawn_error, managed_cloud_key_names,
-        matching_installed_model, model_names_match, normalize_host,
-        parse_configured_inference_config, parse_ollama_model_names,
-        persist_confirmed_inference_config_at, preferred_installed_model,
+        boot_plan, clear_owned_server_state_at, default_local_model,
+        discard_pending_inference_setup_at, format_extension_import_failure,
+        format_missing_rust_toolchain, format_port_unavailable, format_uv_sync_failure,
+        format_uv_sync_spawn_error, managed_cloud_key_names, matching_installed_model,
+        model_names_match, normalize_host, parse_configured_inference_config,
+        parse_ollama_model_names, persist_confirmed_inference_config_at, preferred_installed_model,
         project_root_near_executable, reload_cloud_keys_for_owned_backend_at,
-        should_persist_resolved_model, spawn_owned_child, stage_pending_inference_config_at,
-        startup_installed_model, upsert_engine_host, uv_sync_stderr_tail, BackendManager,
-        InferenceConfig, InferenceCredentialStore, PendingInferenceRollback, SetupStatus,
+        should_persist_resolved_model, spawn_backend_child, spawn_owned_child,
+        stage_pending_inference_config_at, start_managed_boot, startup_installed_model,
+        upsert_engine_host, uv_sync_stderr_tail, Arc, BackendManager, InferenceConfig,
+        InferenceCredentialStore, Mutex, Ordering, PendingInferenceRollback, SetupStatus,
         SourceKind, DESKTOP_UV_SYNC_COMMAND, PENDING_INFERENCE_API_KEY,
     };
     use std::collections::HashMap;
     use std::path::Path;
     use std::sync::Mutex as StdMutex;
+    use std::time::Duration;
 
     #[test]
     fn atlas_cloud_key_is_loaded_with_managed_desktop_keys() {
@@ -3561,6 +3992,35 @@ mod tests {
             std::process::id(),
             nonce
         ))
+    }
+
+    #[test]
+    fn stale_server_state_is_removed_only_for_matching_launch_token() {
+        let root = unique_test_root("owned-server-state");
+        std::fs::create_dir_all(&root).unwrap();
+        let state = root.join("server.json");
+        let pid_file = root.join("server.pid");
+        let identity = root.join("server.identity.json");
+
+        std::fs::write(
+            &state,
+            serde_json::json!({"pid": 12345, "launch_token": "sonic-owned"}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(&pid_file, "12345").unwrap();
+        std::fs::write(&identity, serde_json::json!({"pid": 12345}).to_string()).unwrap();
+
+        clear_owned_server_state_at(&root, "different-owner").unwrap();
+        assert!(state.exists());
+        assert!(pid_file.exists());
+        assert!(identity.exists());
+
+        clear_owned_server_state_at(&root, "sonic-owned").unwrap();
+        assert!(!state.exists());
+        assert!(!pid_file.exists());
+        assert!(!identity.exists());
+
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -4267,7 +4727,7 @@ mod tests {
 
         let mut manager = BackendManager::default();
         manager.boot_task = Some(tauri::async_runtime::JoinHandle::Tokio(task));
-        manager.stop_all().await;
+        manager.stop_all().await.unwrap();
 
         assert!(manager.boot_task.is_none());
         assert!(
@@ -4285,6 +4745,162 @@ mod tests {
         std::fs::write(started, "started").unwrap();
         std::thread::sleep(std::time::Duration::from_millis(500));
         std::fs::write(completed, "completed").unwrap();
+    }
+
+    #[test]
+    fn backend_lifecycle_child_helper() {
+        let Some(started) = std::env::var_os("OPENJARVIS_BACKEND_HELPER_STARTED") else {
+            return;
+        };
+        let completed = std::env::var_os("OPENJARVIS_BACKEND_HELPER_COMPLETED").unwrap();
+        std::fs::write(started, "started").unwrap();
+        std::thread::sleep(std::time::Duration::from_secs(30));
+        std::fs::write(completed, "completed").unwrap();
+    }
+
+    #[tokio::test]
+    async fn repeated_managed_boot_reuses_an_owned_server_process() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "openjarvis-managed-boot-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let started = root.join("started");
+        let completed = root.join("completed");
+        let test_exe = std::env::current_exe().unwrap();
+        let mut cmd = tokio::process::Command::new(test_exe);
+        cmd.args([
+            "--exact",
+            "tests::backend_lifecycle_child_helper",
+            "--nocapture",
+        ])
+        .env("OPENJARVIS_BACKEND_HELPER_STARTED", &started)
+        .env("OPENJARVIS_BACKEND_HELPER_COMPLETED", &completed)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+
+        let child = spawn_backend_child(&mut cmd, None).unwrap();
+        let pid = child.pid;
+        let backend = Arc::new(Mutex::new(BackendManager::default()));
+        backend.lock().await.jarvis = Some(child);
+
+        for _ in 0..200 {
+            if started.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(started.exists(), "test child did not start");
+
+        let status = Arc::new(Mutex::new(SetupStatus::default()));
+        start_managed_boot(backend.clone(), status).await.unwrap();
+
+        let mut manager = backend.lock().await;
+        assert_eq!(manager.jarvis.as_ref().map(|child| child.pid), Some(pid));
+        assert!(manager.boot_task.is_none());
+        manager.stop_jarvis().await.unwrap();
+        assert!(!completed.exists(), "owned process outlived its manager");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn repeated_managed_boot_does_not_replace_an_in_flight_boot() {
+        let backend = Arc::new(Mutex::new(BackendManager::default()));
+        backend
+            .lock()
+            .await
+            .boot_task_active
+            .store(true, Ordering::Release);
+
+        start_managed_boot(
+            backend.clone(),
+            Arc::new(Mutex::new(SetupStatus::default())),
+        )
+        .await
+        .unwrap();
+
+        let manager = backend.lock().await;
+        assert!(manager.boot_task.is_none());
+        assert!(manager.boot_task_active.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn stopping_managed_child_leaves_unrelated_process_running() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "openjarvis-backend-lifecycle-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let owned_started = root.join("owned-started");
+        let owned_completed = root.join("owned-completed");
+        let unrelated_started = root.join("unrelated-started");
+        let unrelated_completed = root.join("unrelated-completed");
+        let test_exe = std::env::current_exe().unwrap();
+
+        let mut owned_cmd = tokio::process::Command::new(&test_exe);
+        owned_cmd
+            .args([
+                "--exact",
+                "tests::backend_lifecycle_child_helper",
+                "--nocapture",
+            ])
+            .env("OPENJARVIS_BACKEND_HELPER_STARTED", &owned_started)
+            .env("OPENJARVIS_BACKEND_HELPER_COMPLETED", &owned_completed)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut owned = spawn_backend_child(&mut owned_cmd, None).unwrap();
+
+        let mut unrelated_cmd = tokio::process::Command::new(&test_exe);
+        unrelated_cmd
+            .args([
+                "--exact",
+                "tests::backend_lifecycle_child_helper",
+                "--nocapture",
+            ])
+            .env("OPENJARVIS_BACKEND_HELPER_STARTED", &unrelated_started)
+            .env("OPENJARVIS_BACKEND_HELPER_COMPLETED", &unrelated_completed)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let mut unrelated = spawn_owned_child(&mut unrelated_cmd).unwrap();
+
+        for path in [&owned_started, &unrelated_started] {
+            for _ in 0..200 {
+                if path.exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            assert!(
+                path.exists(),
+                "test child did not start: {}",
+                path.display()
+            );
+        }
+
+        let stop_result = owned.stop().await;
+        let unrelated_alive = unrelated.try_wait().unwrap().is_none();
+        let _ = unrelated.start_kill();
+        let _ = unrelated.wait().await;
+
+        assert!(stop_result.is_ok(), "{:?}", stop_result);
+        assert!(unrelated_alive, "shutdown affected an unrelated process");
+        assert!(
+            !owned_completed.exists(),
+            "owned helper outlived its manager"
+        );
+        assert!(
+            !unrelated_completed.exists(),
+            "unrelated helper was not terminated by test cleanup"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[tokio::test]

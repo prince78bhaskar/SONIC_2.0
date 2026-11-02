@@ -256,14 +256,19 @@ def memory_search(req: MemorySearchRequest, request: Request):
         return {"results": []}
     try:
         results = backend.retrieve(req.query, top_k=req.top_k)
-        items = [
-            {
-                "content": r.content,
-                "score": getattr(r, "score", 0.0),
-                "metadata": getattr(r, "metadata", {}),
-            }
-            for r in results
-        ]
+        items = []
+        for result in results:
+            metadata = dict(getattr(result, "metadata", {}) or {})
+            source = getattr(result, "source", "")
+            if source and not metadata.get("source"):
+                metadata["source"] = source
+            items.append(
+                {
+                    "content": result.content,
+                    "score": getattr(result, "score", 0.0),
+                    "metadata": metadata,
+                }
+            )
         return {"results": items}
     except Exception as exc:
         raise HTTPException(status_code=500, detail=str(exc))
@@ -373,13 +378,31 @@ def memory_index(req: MemoryIndexRequest, request: Request):
             raise HTTPException(status_code=503, detail="Memory is not configured")
 
         chunks = ingest_path(target)
-        stored = 0
+        chunks_by_source: Dict[str, List[tuple[str, Dict[str, Any]]]] = {}
         for chunk in chunks:
-            metadata = {"source": getattr(chunk, "source", str(target))}
+            source = getattr(chunk, "source", str(target))
+            metadata = {
+                "offset": getattr(chunk, "offset", 0),
+                "index": getattr(chunk, "index", 0),
+            }
             if hasattr(chunk, "metadata") and chunk.metadata:
                 metadata.update(chunk.metadata)
-            backend.store(chunk.content, metadata=metadata)
-            stored += 1
+            chunks_by_source.setdefault(source, []).append((chunk.content, metadata))
+
+        stored = 0
+        replace_sources = getattr(backend, "replace_sources", None)
+        replace_source = getattr(backend, "replace_source", None)
+        if callable(replace_sources):
+            replace_sources(chunks_by_source)
+            stored = sum(len(documents) for documents in chunks_by_source.values())
+        else:
+            for source, documents in chunks_by_source.items():
+                if callable(replace_source):
+                    replace_source(source, documents)
+                else:
+                    for content, metadata in documents:
+                        backend.store(content, source=source, metadata=metadata)
+                stored += len(documents)
 
         result = {"status": "indexed", "chunks_indexed": stored}
         if stored == 0:
